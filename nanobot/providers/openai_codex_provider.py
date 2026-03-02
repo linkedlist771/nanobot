@@ -59,6 +59,9 @@ class OpenAICodexProvider(LLMProvider):
         try:
             try:
                 content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=True)
+                logger.debug(f"Content: {content}")
+                logger.debug(f"Tool calls: {tool_calls}")
+                logger.debug(f"Finish reason: {finish_reason}")
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
@@ -225,6 +228,7 @@ def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:
 async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], None]:
     buffer: list[str] = []
     async for line in response.aiter_lines():
+        logger.debug(f"Line: \n{line}")
         if line == "":
             if buffer:
                 data_lines = [l[5:].strip() for l in buffer if l.startswith("data:")]

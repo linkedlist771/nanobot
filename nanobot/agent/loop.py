@@ -7,7 +7,7 @@ import json
 import re
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -95,6 +95,9 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
+        self._inflight_tasks: set[asyncio.Task] = set()
+        self._worker_semaphore = asyncio.Semaphore(8)
+        self._session_locks: dict[str, asyncio.Lock] = {}
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -136,19 +139,40 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
-        """Update context for all tools that need routing info."""
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.set_context(channel, chat_id, message_id)
+    @staticmethod
+    def _inject_tool_context(
+        tool_name: str,
+        arguments: dict[str, Any],
+        context: dict[str, str | None] | None,
+    ) -> dict[str, Any]:
+        """Inject per-message routing context for tools that need it."""
+        if not context:
+            return arguments
 
-        if spawn_tool := self.tools.get("spawn"):
-            if isinstance(spawn_tool, SpawnTool):
-                spawn_tool.set_context(channel, chat_id)
+        args = dict(arguments or {})
+        channel = context.get("channel")
+        chat_id = context.get("chat_id")
+        message_id = context.get("message_id")
 
-        if cron_tool := self.tools.get("cron"):
-            if isinstance(cron_tool, CronTool):
-                cron_tool.set_context(channel, chat_id)
+        if tool_name == "message":
+            if channel and "channel" not in args:
+                args["channel"] = channel
+            if chat_id and "chat_id" not in args:
+                args["chat_id"] = chat_id
+            if message_id and "message_id" not in args:
+                args["message_id"] = message_id
+        elif tool_name == "spawn":
+            if channel and "origin_channel" not in args:
+                args["origin_channel"] = channel
+            if chat_id and "origin_chat_id" not in args:
+                args["origin_chat_id"] = chat_id
+        elif tool_name == "cron" and args.get("action") == "add":
+            if channel and "channel" not in args:
+                args["channel"] = channel
+            if chat_id and "chat_id" not in args:
+                args["chat_id"] = chat_id
+
+        return args
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -167,16 +191,59 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _extract_embedded_exec_args(content: str | None) -> dict[str, Any] | None:
+        """
+        Recover accidental plain-text exec payloads like:
+        {"command":"python3 ...","working_dir":"..."}
+
+        Extra keys emitted by the model (e.g. "description", "language") are
+        tolerated.  Literal newlines inside the JSON string are handled by a
+        second parse attempt with those characters escaped.
+        """
+        if not content or '"command"' not in content:
+            return None
+
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"\{", content):
+            segment = content[match.start():]
+            obj = None
+            # Primary attempt
+            try:
+                obj, _ = decoder.raw_decode(segment)
+            except Exception:
+                pass
+            # Secondary attempt: escape literal newlines / carriage returns
+            if obj is None:
+                try:
+                    escaped = segment.replace("\n", "\\n").replace("\r", "\\r")
+                    obj, _ = decoder.raw_decode(escaped)
+                except Exception:
+                    continue
+            if not isinstance(obj, dict):
+                continue
+            command = obj.get("command")
+            working_dir = obj.get("working_dir")
+            if not isinstance(command, str) or not command.strip():
+                continue
+            args: dict[str, Any] = {"command": command}
+            if isinstance(working_dir, str) and working_dir.strip():
+                args["working_dir"] = working_dir
+            return args
+        return None
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         on_progress: Callable[[str], Awaitable[None]] | None = None,
-    ) -> tuple[str | None, list[str]]:
-        """Run the agent iteration loop. Returns (final_content, tools_used)."""
+        tool_context: dict[str, str | None] | None = None,
+    ) -> tuple[str | None, list[str], bool]:
+        """Run the agent iteration loop. Returns (final_content, tools_used, message_sent)."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        message_sent = False
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -216,15 +283,70 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    exec_args = self._inject_tool_context(tool_call.name, tool_call.arguments, tool_context)
+                    result = await self.tools.execute(tool_call.name, exec_args)
+                    if tool_call.name == "message" and isinstance(result, str) and result.startswith("Message sent to "):
+                        message_sent = True
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
             else:
                 final_content = self._strip_think(response.content)
+                # Fallback for models that output {"command": "..."} as plain text
+                # instead of issuing a real tool call.
+                embedded_exec = self._extract_embedded_exec_args(final_content)
+                if embedded_exec:
+                    pseudo_id = f"embedded_exec_{iteration}"
+                    messages = self.context.add_assistant_message(
+                        messages,
+                        response.content,
+                        [{
+                            "id": pseudo_id,
+                            "type": "function",
+                            "function": {
+                                "name": "exec",
+                                "arguments": json.dumps(embedded_exec, ensure_ascii=False),
+                            },
+                        }],
+                        reasoning_content=response.reasoning_content,
+                    )
+                    if on_progress:
+                        preview = embedded_exec.get("command", "")
+                        if isinstance(preview, str):
+                            preview = preview.strip().replace("\n", " ")
+                            preview = preview[:60] + ("..." if len(preview) > 60 else "")
+                            await on_progress(f'exec("{preview}")')
+                    tools_used.append("exec")
+                    result = await self.tools.execute("exec", embedded_exec)
+                    messages = self.context.add_tool_result(messages, pseudo_id, "exec", result)
+                    continue
                 break
 
-        return final_content, tools_used
+        return final_content, tools_used, message_sent
+
+    def _track_task(self, task: asyncio.Task) -> None:
+        """Track background worker tasks for graceful shutdown."""
+        self._inflight_tasks.add(task)
+        task.add_done_callback(self._inflight_tasks.discard)
+
+    async def _handle_inbound(self, msg: InboundMessage) -> None:
+        """Process one inbound message with bounded global concurrency."""
+        async with self._worker_semaphore:
+            try:
+                response = await self._process_message(msg)
+                if response is not None:
+                    await self.bus.publish_outbound(response)
+                elif msg.channel == "cli":
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id, content="", metadata=msg.metadata or {},
+                    ))
+            except Exception as e:
+                logger.error("Error processing message: {}", e)
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"Sorry, I encountered an error: {str(e)}"
+                ))
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -238,23 +360,11 @@ class AgentLoop:
                     self.bus.consume_inbound(),
                     timeout=1.0
                 )
-                try:
-                    response = await self._process_message(msg)
-                    if response is not None:
-                        await self.bus.publish_outbound(response)
-                    elif msg.channel == "cli":
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel=msg.channel, chat_id=msg.chat_id, content="", metadata=msg.metadata or {},
-                        ))
-                except Exception as e:
-                    logger.error("Error processing message: {}", e)
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=f"Sorry, I encountered an error: {str(e)}"
-                    ))
+                self._track_task(asyncio.create_task(self._handle_inbound(msg)))
             except asyncio.TimeoutError:
                 continue
+        if self._inflight_tasks:
+            await asyncio.gather(*self._inflight_tasks, return_exceptions=True)
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
@@ -284,12 +394,18 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             messages = self.context.build_messages(
                 history=session.get_history(max_messages=self.memory_window),
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
-            final_content, _ = await self._run_agent_loop(messages)
+            final_content, _, _ = await self._run_agent_loop(
+                messages,
+                tool_context={
+                    "channel": channel,
+                    "chat_id": chat_id,
+                    "message_id": msg.metadata.get("message_id"),
+                },
+            )
             session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
             session.add_message("assistant", final_content or "Background task completed.")
             self.sessions.save(session)
@@ -300,76 +416,77 @@ class AgentLoop:
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         key = session_key or msg.session_key
-        session = self.sessions.get_or_create(key)
+        async with self._session_locks.setdefault(key, asyncio.Lock()):
+            session = self.sessions.get_or_create(key)
 
-        # Slash commands
-        cmd = msg.content.strip().lower()
-        if cmd == "/new":
-            messages_to_archive = session.messages.copy()
-            session.clear()
+            # Slash commands
+            cmd = msg.content.strip().lower()
+            if cmd == "/new":
+                messages_to_archive = session.messages.copy()
+                session.clear()
+                self.sessions.save(session)
+                self.sessions.invalidate(session.key)
+
+                async def _consolidate_and_cleanup():
+                    temp = Session(key=session.key)
+                    temp.messages = messages_to_archive
+                    await self._consolidate_memory(temp, archive_all=True)
+
+                asyncio.create_task(_consolidate_and_cleanup())
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="New session started. Memory consolidation in progress.")
+            if cmd == "/help":
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
+
+            if len(session.messages) > self.memory_window and session.key not in self._consolidating:
+                self._consolidating.add(session.key)
+
+                async def _consolidate_and_unlock():
+                    try:
+                        await self._consolidate_memory(session)
+                    finally:
+                        self._consolidating.discard(session.key)
+
+                asyncio.create_task(_consolidate_and_unlock())
+
+            initial_messages = self.context.build_messages(
+                history=session.get_history(max_messages=self.memory_window),
+                current_message=msg.content,
+                media=msg.media if msg.media else None,
+                channel=msg.channel, chat_id=msg.chat_id,
+            )
+
+            async def _bus_progress(content: str) -> None:
+                meta = dict(msg.metadata or {})
+                meta["_progress"] = True
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
+                ))
+
+            final_content, tools_used, message_sent = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                tool_context={
+                    "channel": msg.channel,
+                    "chat_id": msg.chat_id,
+                    "message_id": msg.metadata.get("message_id"),
+                },
+            )
+
+            if final_content is None:
+                final_content = "I've completed processing but have no response to give."
+
+            preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+            logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+
+            session.add_message("user", msg.content)
+            session.add_message("assistant", final_content,
+                                tools_used=tools_used if tools_used else None)
             self.sessions.save(session)
-            self.sessions.invalidate(session.key)
 
-            async def _consolidate_and_cleanup():
-                temp = Session(key=session.key)
-                temp.messages = messages_to_archive
-                await self._consolidate_memory(temp, archive_all=True)
-
-            asyncio.create_task(_consolidate_and_cleanup())
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started. Memory consolidation in progress.")
-        if cmd == "/help":
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
-
-        if len(session.messages) > self.memory_window and session.key not in self._consolidating:
-            self._consolidating.add(session.key)
-
-            async def _consolidate_and_unlock():
-                try:
-                    await self._consolidate_memory(session)
-                finally:
-                    self._consolidating.discard(session.key)
-
-            asyncio.create_task(_consolidate_and_unlock())
-
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
-
-        initial_messages = self.context.build_messages(
-            history=session.get_history(max_messages=self.memory_window),
-            current_message=msg.content,
-            media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
-        )
-
-        async def _bus_progress(content: str) -> None:
-            meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
-            ))
-
-        final_content, tools_used = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
-        )
-
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
-
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
-
-        session.add_message("user", msg.content)
-        session.add_message("assistant", final_content,
-                            tools_used=tools_used if tools_used else None)
-        self.sessions.save(session)
-
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
-                return None
+        if message_sent:
+            return None
 
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
