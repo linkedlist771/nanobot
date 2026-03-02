@@ -192,6 +192,13 @@ class ChannelManager:
                     self.bus.consume_outbound(),
                     timeout=1.0
                 )
+                logger.debug(
+                    "Dispatching outbound message: channel={}, chat_id={}, progress={}, content={}",
+                    msg.channel,
+                    msg.chat_id,
+                    bool((msg.metadata or {}).get("_progress")),
+                    (msg.content[:120] + "...") if len(msg.content) > 120 else msg.content,
+                )
                 
                 channel = self.channels.get(msg.channel)
                 if channel:

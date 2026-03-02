@@ -430,7 +430,17 @@ class AgentLoop:
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         key = session_key or msg.session_key
-        async with self._session_locks.setdefault(key, asyncio.Lock()):
+        lock = self._session_locks.setdefault(key, asyncio.Lock())
+        if lock.locked():
+            logger.info("Session {} is busy; queueing new message from {}:{}", key, msg.channel, msg.sender_id)
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="上一条请求还在执行，我已经收到这条消息，当前排队处理中。",
+                metadata={**(msg.metadata or {}), "_progress": True, "_queued": True},
+            ))
+
+        async with lock:
             session = self.sessions.get_or_create(key)
 
             # Slash commands
@@ -474,6 +484,12 @@ class AgentLoop:
             async def _bus_progress(content: str) -> None:
                 meta = dict(msg.metadata or {})
                 meta["_progress"] = True
+                logger.debug(
+                    "Publishing progress message: channel={}, chat_id={}, content={}",
+                    msg.channel,
+                    msg.chat_id,
+                    (content[:120] + "...") if len(content) > 120 else content,
+                )
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
                 ))

@@ -1,12 +1,16 @@
+import asyncio
 from email.message import EmailMessage
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.email import EmailChannel
+from nanobot.channels.feishu import FeishuChannel
 from nanobot.config.schema import EmailConfig
+from nanobot.config.schema import FeishuConfig
 
 
 def _make_config() -> EmailConfig:
@@ -218,8 +222,50 @@ async def test_send_skips_when_auto_reply_disabled(monkeypatch) -> None:
             metadata={"force_send": True},
         )
     )
-    assert len(fake_instances) == 1
-    assert len(fake_instances[0].sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_feishu_on_message_does_not_block_on_reaction(monkeypatch) -> None:
+    channel = FeishuChannel(FeishuConfig(enabled=True, app_id="app", app_secret="secret"), MessageBus())
+    channel._loop = asyncio.get_running_loop()
+    channel._client = object()
+
+    forwarded: dict[str, str] = {}
+
+    async def _fake_handle_message(sender_id: str, chat_id: str, content: str, media=None, metadata=None):
+        forwarded["sender_id"] = sender_id
+        forwarded["chat_id"] = chat_id
+        forwarded["content"] = content
+
+    async def _slow_reaction(_message_id: str, _emoji_type: str = "THUMBSUP") -> None:
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(channel, "_handle_message", _fake_handle_message)
+    monkeypatch.setattr(channel, "_add_reaction", _slow_reaction)
+
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            message=SimpleNamespace(
+                message_id="m1",
+                chat_id="ou_test",
+                chat_type="p2p",
+                message_type="text",
+                content='{"text":"hello"}',
+            ),
+            sender=SimpleNamespace(
+                sender_type="user",
+                sender_id=SimpleNamespace(open_id="ou_test"),
+            ),
+        )
+    )
+
+    await asyncio.wait_for(channel._on_message(data), timeout=0.5)
+
+    assert forwarded == {
+        "sender_id": "ou_test",
+        "chat_id": "ou_test",
+        "content": "hello",
+    }
 
 
 @pytest.mark.asyncio

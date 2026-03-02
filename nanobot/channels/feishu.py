@@ -5,6 +5,7 @@ import json
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -240,6 +241,9 @@ class FeishuChannel(BaseChannel):
     """
     
     name = "feishu"
+    _HEALTH_CHECK_INTERVAL = 15
+    _HEALTH_LOG_INTERVAL = 60
+    _WS_RESTART_COOLDOWN = 30
     
     def __init__(self, config: FeishuConfig, bus: MessageBus):
         super().__init__(config, bus)
@@ -249,6 +253,13 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._ws_generation = 0
+        self._last_ws_start_at = 0.0
+        self._last_ws_restart_at = 0.0
+        self._last_health_log_at = 0.0
+        self._last_inbound_event_at = 0.0
+        self._last_inbound_forward_at = 0.0
+        self._restart_lock = asyncio.Lock()
     
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
@@ -270,41 +281,15 @@ class FeishuChannel(BaseChannel):
             .log_level(lark.LogLevel.INFO) \
             .build()
         
-        # Create event handler (only register message receive, ignore other events)
-        event_handler = lark.EventDispatcherHandler.builder(
-            self.config.encrypt_key or "",
-            self.config.verification_token or "",
-        ).register_p2_im_message_receive_v1(
-            self._on_message_sync
-        ).build()
-        
-        # Create WebSocket client for long connection
-        self._ws_client = lark.ws.Client(
-            self.config.app_id,
-            self.config.app_secret,
-            event_handler=event_handler,
-            log_level=lark.LogLevel.INFO
-        )
-        
-        # Start WebSocket client in a separate thread with reconnect loop
-        def run_ws():
-            while self._running:
-                try:
-                    self._ws_client.start()
-                except Exception as e:
-                    logger.warning("Feishu WebSocket error: {}", e)
-                if self._running:
-                    import time; time.sleep(5)
-        
-        self._ws_thread = threading.Thread(target=run_ws, daemon=True)
-        self._ws_thread.start()
+        self._start_ws_client()
         
         logger.info("Feishu bot started with WebSocket long connection")
         logger.info("No public IP required - using WebSocket to receive events")
         
         # Keep running until stopped
         while self._running:
-            await asyncio.sleep(1)
+            await asyncio.sleep(self._HEALTH_CHECK_INTERVAL)
+            await self._health_check()
     
     async def stop(self) -> None:
         """Stop the Feishu bot."""
@@ -315,6 +300,79 @@ class FeishuChannel(BaseChannel):
             except Exception as e:
                 logger.warning("Error stopping WebSocket client: {}", e)
         logger.info("Feishu bot stopped")
+
+    def _build_ws_client(self) -> Any:
+        event_handler = lark.EventDispatcherHandler.builder(
+            self.config.encrypt_key or "",
+            self.config.verification_token or "",
+        ).register_p2_im_message_receive_v1(
+            self._on_message_sync
+        ).build()
+        return lark.ws.Client(
+            self.config.app_id,
+            self.config.app_secret,
+            event_handler=event_handler,
+            log_level=lark.LogLevel.INFO,
+        )
+
+    def _start_ws_client(self) -> None:
+        self._ws_generation += 1
+        generation = self._ws_generation
+        self._ws_client = self._build_ws_client()
+        self._last_ws_start_at = time.monotonic()
+        logger.info("Starting Feishu WebSocket client generation {}", generation)
+
+        def run_ws() -> None:
+            logger.info("Feishu WebSocket thread started for generation {}", generation)
+            while self._running and generation == self._ws_generation:
+                try:
+                    self._ws_client.start()
+                except Exception as e:
+                    logger.warning("Feishu WebSocket error (generation {}): {}", generation, e)
+                if self._running and generation == self._ws_generation:
+                    time.sleep(5)
+            logger.warning("Feishu WebSocket thread exiting for generation {}", generation)
+
+        self._ws_thread = threading.Thread(target=run_ws, daemon=True, name=f"feishu-ws-{generation}")
+        self._ws_thread.start()
+
+    async def _restart_ws_client(self, reason: str) -> None:
+        async with self._restart_lock:
+            now = time.monotonic()
+            if now - self._last_ws_restart_at < self._WS_RESTART_COOLDOWN:
+                return
+            self._last_ws_restart_at = now
+            logger.warning("Restarting Feishu WebSocket client: {}", reason)
+            old_client = self._ws_client
+            try:
+                if old_client:
+                    await asyncio.get_running_loop().run_in_executor(None, old_client.stop)
+            except Exception as e:
+                logger.warning("Error stopping stale Feishu WebSocket client: {}", e)
+            self._start_ws_client()
+
+    async def _health_check(self) -> None:
+        now = time.monotonic()
+        thread_alive = bool(self._ws_thread and self._ws_thread.is_alive())
+        conn = getattr(self._ws_client, "_conn", None) if self._ws_client else None
+        conn_open = bool(conn and not getattr(conn, "closed", False))
+
+        if now - self._last_health_log_at >= self._HEALTH_LOG_INTERVAL:
+            logger.info(
+                "Feishu health: ws_generation={}, thread_alive={}, conn_open={}, last_inbound_event_age={:.1f}s, last_forward_age={:.1f}s",
+                self._ws_generation,
+                thread_alive,
+                conn_open,
+                (now - self._last_inbound_event_at) if self._last_inbound_event_at else -1.0,
+                (now - self._last_inbound_forward_at) if self._last_inbound_forward_at else -1.0,
+            )
+            self._last_health_log_at = now
+
+        if not thread_alive:
+            await self._restart_ws_client("thread is not alive")
+            return
+        if not conn_open and now - self._last_ws_start_at > self._WS_RESTART_COOLDOWN:
+            await self._restart_ws_client("connection is not open")
     
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
         """Sync helper for adding reaction (runs in thread pool)."""
@@ -346,7 +404,35 @@ class FeishuChannel(BaseChannel):
             return
         
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type),
+                timeout=3.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Timed out adding Feishu {} reaction to message {}", emoji_type, message_id)
+        except Exception as e:
+            logger.warning("Error adding Feishu {} reaction to message {}: {}", emoji_type, message_id, e)
+
+    def _schedule_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> None:
+        """Fire-and-forget reaction so inbound message forwarding never blocks on Feishu APIs."""
+        if not self._loop or not self._loop.is_running():
+            return
+
+        async def _run() -> None:
+            await self._add_reaction(message_id, emoji_type)
+
+        task = self._loop.create_task(_run())
+
+        def _done_callback(done: asyncio.Task) -> None:
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning("Background Feishu reaction task failed for {}: {}", message_id, e)
+
+        task.add_done_callback(_done_callback)
     
     # Regex to match markdown tables (header + separator + data rows)
     _TABLE_RE = re.compile(
@@ -634,7 +720,28 @@ class FeishuChannel(BaseChannel):
         Schedules async handling in the main event loop.
         """
         if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+            self._last_inbound_event_at = time.monotonic()
+            try:
+                event = data.event
+                message = event.message
+                logger.debug(
+                    "Feishu inbound event scheduled from WS thread: message_id={}, chat_id={}, msg_type={}",
+                    getattr(message, "message_id", ""),
+                    getattr(message, "chat_id", ""),
+                    getattr(message, "message_type", ""),
+                )
+            except Exception:
+                logger.debug("Feishu inbound event scheduled from WS thread")
+            future = asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+            future.add_done_callback(self._on_message_future_done)
+        else:
+            logger.warning("Dropping Feishu inbound event because main loop is not running")
+
+    def _on_message_future_done(self, future) -> None:
+        try:
+            future.result()
+        except Exception as e:
+            logger.error("Feishu inbound coroutine failed after scheduling: {}", e)
     
     async def _on_message(self, data: "P2ImMessageReceiveV1") -> None:
         """Handle incoming message from Feishu."""
@@ -662,8 +769,17 @@ class FeishuChannel(BaseChannel):
             chat_type = message.chat_type
             msg_type = message.message_type
 
-            # Add reaction
-            await self._add_reaction(message_id, "THUMBSUP")
+            logger.debug(
+                "Feishu inbound message received: message_id={}, sender_id={}, chat_id={}, chat_type={}, msg_type={}",
+                message_id,
+                sender_id,
+                chat_id,
+                chat_type,
+                msg_type,
+            )
+
+            # Add reaction in background so slow Feishu APIs cannot block inbound forwarding.
+            self._schedule_reaction(message_id, "THUMBSUP")
 
             # Parse content
             content_parts = []
@@ -706,6 +822,12 @@ class FeishuChannel(BaseChannel):
 
             # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
+            logger.debug(
+                "Forwarding Feishu inbound to bus: reply_to={}, content_preview={}",
+                reply_to,
+                (content[:120] + "...") if len(content) > 120 else content,
+            )
+            self._last_inbound_forward_at = time.monotonic()
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
