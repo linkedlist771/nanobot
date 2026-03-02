@@ -2,6 +2,7 @@
 
 from typing import Any
 
+from nanobot.agent import tool_context
 from nanobot.agent.tools.base import Tool
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronSchedule
@@ -16,7 +17,7 @@ class CronTool(Tool):
         self._chat_id = ""
 
     def set_context(self, channel: str, chat_id: str) -> None:
-        """Set the current session context for delivery."""
+        """Legacy: prefer contextvars set by AgentLoop._set_tool_context()."""
         self._channel = channel
         self._chat_id = chat_id
 
@@ -89,7 +90,10 @@ class CronTool(Tool):
     ) -> str:
         if not message:
             return "Error: message is required for add"
-        if not self._channel or not self._chat_id:
+        # Prefer per-request contextvars, fall back to instance defaults
+        channel = tool_context.current_channel.get("") or self._channel
+        chat_id = tool_context.current_chat_id.get("") or self._chat_id
+        if not channel or not chat_id:
             return "Error: no session context (channel/chat_id)"
         if tz and not cron_expr:
             return "Error: tz can only be used with cron_expr"
@@ -122,8 +126,8 @@ class CronTool(Tool):
             schedule=schedule,
             message=message,
             deliver=True,
-            channel=self._channel,
-            to=self._chat_id,
+            channel=channel,
+            to=chat_id,
             delete_after_run=delete_after,
         )
         return f"Created job '{job.name}' (id: {job.id})"

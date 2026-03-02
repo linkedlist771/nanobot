@@ -15,6 +15,7 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent import tool_context
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
@@ -109,7 +110,7 @@ class AgentLoop:
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
-        self._processing_lock = asyncio.Lock()
+        self._session_save_locks: dict[str, asyncio.Lock] = {}  # per-session save lock
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -152,12 +153,13 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
-        """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
-            if tool := self.tools.get(name):
-                if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+    @staticmethod
+    def _set_tool_context(channel: str, chat_id: str, message_id: str | None = None) -> None:
+        """Set per-request contextvars for tool routing (task-isolated)."""
+        tool_context.current_channel.set(channel)
+        tool_context.current_chat_id.set(chat_id)
+        tool_context.current_message_id.set(message_id)
+        tool_context.sent_in_turn.set(False)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -238,6 +240,9 @@ class AgentLoop:
                 # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
                     logger.error("LLM returned error: {}", (clean or "")[:200])
+                    from traceback import format_exc
+                    logger.error("LLM error details:\n{}", format_exc())
+                    
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
                 messages = self.context.add_assistant_message(
@@ -292,26 +297,25 @@ class AgentLoop:
         ))
 
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under the global lock."""
-        async with self._processing_lock:
-            try:
-                response = await self._process_message(msg)
-                if response is not None:
-                    await self.bus.publish_outbound(response)
-                elif msg.channel == "cli":
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="", metadata=msg.metadata or {},
-                    ))
-            except asyncio.CancelledError:
-                logger.info("Task cancelled for session {}", msg.session_key)
-                raise
-            except Exception:
-                logger.exception("Error processing message for session {}", msg.session_key)
+        """Process a message concurrently (no global lock)."""
+        try:
+            response = await self._process_message(msg)
+            if response is not None:
+                await self.bus.publish_outbound(response)
+            elif msg.channel == "cli":
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
+                    content="", metadata=msg.metadata or {},
                 ))
+        except asyncio.CancelledError:
+            logger.info("Task cancelled for session {}", msg.session_key)
+            raise
+        except Exception:
+            logger.exception("Error processing message for session {}", msg.session_key)
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Sorry, I encountered an error.",
+            ))
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
@@ -412,9 +416,6 @@ class AgentLoop:
             self._consolidation_tasks.add(_task)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
 
         history = session.get_history(max_messages=self.memory_window)
         initial_messages = self.context.build_messages(
@@ -439,10 +440,12 @@ class AgentLoop:
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
-        self._save_turn(session, all_msgs, 1 + len(history))
-        self.sessions.save(session)
+        save_lock = self._session_save_locks.setdefault(key, asyncio.Lock())
+        async with save_lock:
+            self._save_turn(session, all_msgs, 1 + len(history))
+            self.sessions.save(session)
 
-        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+        if tool_context.sent_in_turn.get(False):
             return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content

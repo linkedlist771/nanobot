@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import queue
 import re
 import threading
 from collections import OrderedDict
@@ -269,6 +270,8 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._pending_messages: queue.Queue = queue.Queue()  # Thread-safe buffer for incoming messages
+        self._drain_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
@@ -320,12 +323,23 @@ class FeishuChannel(BaseChannel):
         self._ws_thread = threading.Thread(target=run_ws, daemon=True)
         self._ws_thread.start()
 
+        # Start async drain loop to process buffered messages
+        self._drain_task = asyncio.create_task(self._drain_pending_messages())
+
         logger.info("Feishu bot started with WebSocket long connection")
         logger.info("No public IP required - using WebSocket to receive events")
 
         # Keep running until stopped
-        while self._running:
-            await asyncio.sleep(1)
+        try:
+            while self._running:
+                await asyncio.sleep(1)
+        finally:
+            if self._drain_task:
+                self._drain_task.cancel()
+                try:
+                    await self._drain_task
+                except asyncio.CancelledError:
+                    pass
 
     async def stop(self) -> None:
         """
@@ -665,10 +679,34 @@ class FeishuChannel(BaseChannel):
     def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
         """
         Sync handler for incoming messages (called from WebSocket thread).
-        Schedules async handling in the main event loop.
+        Buffers the message into a thread-safe queue — never drops.
         """
-        if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+        self._pending_messages.put(data)
+        logger.debug("Feishu message buffered, queue size: {}", self._pending_messages.qsize())
+
+    async def _drain_pending_messages(self) -> None:
+        """
+        Continuously drain the thread-safe pending message queue
+        and process each message in the async event loop.
+        Messages are never lost — they stay in the queue until processed.
+        """
+        loop = asyncio.get_running_loop()
+        while self._running:
+            try:
+                # Block in a thread so we don't spin the event loop
+                data = await loop.run_in_executor(
+                    None, self._pending_messages.get, True, 0.5
+                )
+            except queue.Empty:
+                continue
+            except Exception:
+                await asyncio.sleep(0.5)
+                continue
+
+            try:
+                await self._on_message(data)
+            except Exception as e:
+                logger.error("Feishu _on_message failed: {}", e)
 
     async def _on_message(self, data: "P2ImMessageReceiveV1") -> None:
         """Handle incoming message from Feishu."""
@@ -680,6 +718,7 @@ class FeishuChannel(BaseChannel):
             # Deduplication check
             message_id = message.message_id
             if message_id in self._processed_message_ids:
+                logger.debug("Feishu message {} already processed, skipping", message_id)
                 return
             self._processed_message_ids[message_id] = None
 
@@ -698,6 +737,9 @@ class FeishuChannel(BaseChannel):
 
             # Add reaction
             await self._add_reaction(message_id, self.config.react_emoji)
+
+            logger.info("Feishu message received: id={}, type={}, chat_type={}, sender={}",
+                        message_id, msg_type, chat_type, sender_id)
 
             # Parse content
             content_parts = []
@@ -744,6 +786,7 @@ class FeishuChannel(BaseChannel):
             content = "\n".join(content_parts) if content_parts else ""
 
             if not content and not media_paths:
+                logger.debug("Feishu message {} has no content or media, skipping", message_id)
                 return
 
             # Forward to message bus
