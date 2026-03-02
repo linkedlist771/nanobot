@@ -175,6 +175,18 @@ class AgentLoop:
         return args
 
     @staticmethod
+    def _strip_null_args(args: dict[str, Any]) -> dict[str, Any]:
+        """Remove keys whose value is None.
+
+        Codex strict mode requires every property to appear in ``required``,
+        so optional parameters are declared as ``anyOf: [schema, null]`` and
+        the model passes ``null`` when it doesn't want to use them.  Strip
+        those nulls before dispatch so tool ``execute`` methods receive only
+        the parameters they actually need.
+        """
+        return {k: v for k, v in args.items() if v is not None}
+
+    @staticmethod
     def _strip_think(text: str | None) -> str | None:
         """Remove <think>…</think> blocks that some models embed in content."""
         if not text:
@@ -283,7 +295,9 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    exec_args = self._inject_tool_context(tool_call.name, tool_call.arguments, tool_context)
+                    exec_args = self._strip_null_args(
+                        self._inject_tool_context(tool_call.name, tool_call.arguments, tool_context)
+                    )
                     result = await self.tools.execute(tool_call.name, exec_args)
                     if tool_call.name == "message" and isinstance(result, str) and result.startswith("Message sent to "):
                         message_sent = True

@@ -115,21 +115,70 @@ async def _request_codex(
 
 
 def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert OpenAI function-calling schema to Codex flat format."""
+    """Convert OpenAI function-calling schema to Codex strict-mode format.
+
+    The Codex Responses API always enforces strict mode (``strict: true``),
+    which requires every property listed in ``properties`` to also appear in
+    ``required``.  Optional parameters (those absent from ``required``) are
+    converted to a nullable ``anyOf`` union so the model can legally pass
+    ``null`` instead of omitting them, satisfying strict mode without forcing
+    the model to invent values for fields like ``working_dir`` or
+    action-specific ``cron`` arguments.
+    """
     converted: list[dict[str, Any]] = []
     for tool in tools:
         fn = (tool.get("function") or {}) if tool.get("type") == "function" else tool
         name = fn.get("name")
         if not name:
             continue
-        params = fn.get("parameters") or {}
+        params = _make_strict_compatible(fn.get("parameters") or {})
         converted.append({
             "type": "function",
             "name": name,
             "description": fn.get("description") or "",
-            "parameters": params if isinstance(params, dict) else {},
+            "parameters": params,
         })
     return converted
+
+
+def _make_strict_compatible(params: Any) -> dict[str, Any]:
+    """Rewrite a JSON-Schema ``object`` so every property is in ``required``.
+
+    Optional properties (present in ``properties`` but absent from
+    ``required``) are wrapped in ``{"anyOf": [original, {"type": "null"}]}``
+    so the model can legally supply ``null`` when it doesn't want to use them.
+    ``additionalProperties`` is set to ``False`` to satisfy the Codex API.
+    Nested ``object`` schemas are recursively converted.
+    """
+    if not isinstance(params, dict):
+        return {}
+    if params.get("type") != "object":
+        return {k: v for k, v in params.items() if k != "additionalProperties"}
+
+    props: dict[str, Any] = {}
+    required_set: set[str] = set(params.get("required") or [])
+    new_required: list[str] = list(params.get("required") or [])
+
+    for key, schema in (params.get("properties") or {}).items():
+        if not isinstance(schema, dict):
+            props[key] = schema
+            continue
+        # Recurse into nested objects.
+        converted_schema = _make_strict_compatible(schema) if schema.get("type") == "object" else schema
+        if key in required_set:
+            props[key] = converted_schema
+        else:
+            # Wrap in anyOf so the model can pass null for optional params.
+            props[key] = {"anyOf": [converted_schema, {"type": "null"}]}
+            new_required.append(key)
+
+    result: dict[str, Any] = {
+        "type": "object",
+        "properties": props,
+        "required": new_required,
+        "additionalProperties": False,
+    }
+    return result
 
 
 def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
@@ -227,23 +276,35 @@ def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:
 
 async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], None]:
     buffer: list[str] = []
+
+    def _flush(buf: list[str]):
+        data_lines = [l[5:].strip() for l in buf if l.startswith("data:")]
+        if not data_lines:
+            return None
+        data = "\n".join(data_lines).strip()
+        if not data or data == "[DONE]":
+            return None
+        try:
+            return json.loads(data)
+        except Exception:
+            return None
+
     async for line in response.aiter_lines():
         logger.debug(f"Line: \n{line}")
         if line == "":
             if buffer:
-                data_lines = [l[5:].strip() for l in buffer if l.startswith("data:")]
+                event = _flush(buffer)
                 buffer = []
-                if not data_lines:
-                    continue
-                data = "\n".join(data_lines).strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    yield json.loads(data)
-                except Exception:
-                    continue
+                if event is not None:
+                    yield event
             continue
         buffer.append(line)
+
+    # Flush any trailing event if the stream ended without a final blank line.
+    if buffer:
+        event = _flush(buffer)
+        if event is not None:
+            yield event
 
 
 async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequest], str]:
