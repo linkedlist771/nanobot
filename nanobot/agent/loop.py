@@ -242,6 +242,7 @@ class AgentLoop:
                     logger.error("LLM returned error: {}", (clean or "")[:200])
                     from traceback import format_exc
                     logger.error("LLM error details:\n{}", format_exc())
+                    logger.error("Full LLM response: {}\n", response)
                     
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
