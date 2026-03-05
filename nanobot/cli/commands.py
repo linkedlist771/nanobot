@@ -18,6 +18,7 @@ from rich.table import Table
 from rich.text import Text
 
 from nanobot import __logo__, __version__
+from nanobot.agent import tool_context
 from nanobot.config.schema import Config
 from nanobot.utils.helpers import sync_workspace_templates
 
@@ -311,7 +312,7 @@ def gateway(
         )
 
         message_tool = agent.tools.get("message")
-        if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
+        if isinstance(message_tool, MessageTool) and tool_context.sent_in_turn.get():
             return response
 
         if job.payload.deliver and job.payload.to and response:
